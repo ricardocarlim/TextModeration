@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "TextMediation.Worker": {
+      "commandName": "Project"
+    },
+    "Container (Dockerfile)": {
+      "commandName": "Docker"
+    }
+  }
+}

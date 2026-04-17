@@ -1,0 +1,78 @@
+name: textmediation
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: tm-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks: [tm-net]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: tm-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,HOST://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,HOST://localhost:9094
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+    networks: [tm-net]
+
+  translator:
+    build:
+      context: ./src/TextMediation.Translator
+      dockerfile: Dockerfile
+    container_name: tm-translator
+    environment:
+      TRANSLATOR_MODEL: Helsinki-NLP/opus-mt-grk-en
+      TRANSLATOR_MAX_LENGTH: "256"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+    networks: [tm-net]
+
+  moderation:
+    build:
+      context: .
+      dockerfile: src/TextMediation.Worker/Dockerfile
+    container_name: tm-moderation
+    depends_on:
+      - zookeeper
+      - kafka
+      - translator
+    environment:
+      DOTNET_ENVIRONMENT: Production
+      Kafka__BootstrapServers: kafka:9092
+      Kafka__GroupId: moderation-worker
+      Kafka__InputTopic: comments.incoming
+      Kafka__OutputTopic: comments.moderated
+      Kafka__AutoOffsetReset: Earliest
+      Model__ModelPath: /models/model.onnx
+      Model__SentencePiecePath: /models/sentencepiece.bpe.model
+      Model__MaxSequenceLength: "128"
+      Model__IntraOpNumThreads: "2"
+      Translator__BaseUrl: http://translator:8000
+      Translator__TimeoutSeconds: "15"
+      Translator__GreekRatioThreshold: "0.30"
+    volumes:
+      - ./models:/models:ro
+    restart: unless-stopped
+    networks: [tm-net]
+
+networks:
+  tm-net:
+    driver: bridge
