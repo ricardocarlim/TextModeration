@@ -1,299 +1,279 @@
-# Serviço Reativo de Moderação de Texto — .NET 8 + Kafka + ONNX
+# TextMediation
 
-## Context
-
-O repositório atual (`TextMediation.sln`) contém apenas um esqueleto de Web API (`src/TextMediation.API`) gerado pelo template padrão do Visual Studio (Controllers, WeatherForecast, Swagger). O objetivo é transformar isso em um serviço **reativo** que:
-
-1. Consome mensagens do tópico Kafka `comments.incoming`.
-2. Classifica o texto via **DistilXLM-R multilíngue** rodando offline com **ONNX Runtime**.
-3. Publica o veredito em `comments.moderated`.
-4. Roda totalmente local via `docker-compose` (Zookeeper + Kafka + serviço .NET).
-
-Como o projeto é praticamente greenfield, o plano substitui o projeto Web API atual por um **Worker Service** (`Microsoft.NET.Sdk.Worker`), que é o SDK apropriado para um `BackgroundService` de longa duração sem exposição HTTP. O nome do projeto passa a ser `TextMediation.Worker`.
+Real-time multilingual comment moderation pipeline built on Apache Kafka, ONNX Runtime, and XLM-RoBERTa. Detects toxicity in Portuguese, English, and Greek using a fine-tuned transformer model, with automatic Greek→English translation via a FastAPI sidecar.
 
 ---
 
-## Arquitetura (visão geral)
+## Architecture
 
 ```
-┌─────────────────┐     ┌──────────────────────────────────────┐     ┌────────────────────┐
-│ Kafka topic:    │ ──▶ │ TextMediation.Worker (BackgroundSvc) │ ──▶ │ Kafka topic:       │
-│ comments.       │     │  ┌──────────┐  ┌──────────────────┐  │     │ comments.moderated │
-│ incoming        │     │  │ Consumer │─▶│ XlmrTokenizer    │  │     │                    │
-└─────────────────┘     │  └──────────┘  └────────┬─────────┘  │     └────────────────────┘
-                        │                         ▼            │
-                        │                 ┌────────────────┐   │
-                        │                 │ OnnxInference  │   │
-                        │                 │ (InferenceSession, │
-                        │                 │  reutilizada)     │
-                        │                 └────────┬─────────┘  │
-                        │                          ▼            │
-                        │                 ┌────────────────┐   │
-                        │                 │ Producer       │   │
-                        │                 └────────────────┘   │
-                        └──────────────────────────────────────┘
+                      ┌─────────────────────────────────────────┐
+                      │           tm-moderation (.NET 8)         │
+                      │                                          │
+Kafka                 │  ModerationWorker                        │         Kafka
+comments.incoming ───►│    │                                     │───►  comments.moderated
+                      │    ├─ IsGreek? ──► HttpTranslator ──►    │
+                      │    │               (tm-translator)        │
+                      │    └─ OnnxModerationService              │
+                      │         XlmrTokenizer + ONNX Runtime     │
+                      └─────────────────────────────────────────┘
+                                          ▲
+                      ┌───────────────────┘
+                      │  tm-translator (Python / FastAPI)
+                      │  Helsinki-NLP/opus-mt-grk-en
+                      └─────────────────────────────────────────
 ```
 
-Princípios-chave de baixa latência:
-- **InferenceSession singleton** (construção cara, thread-safe para `Run`).
-- **Tokenizer singleton** (carrega `sentencepiece.bpe.model` uma única vez).
-- **Producer singleton** com `linger.ms` baixo.
-- Commit manual no consumer (após produce + flush) → **at-least-once** end-to-end.
-- Buffers `Int64` reutilizados por mensagem (tamanho `maxSeqLen = 128`).
+### Flow
+
+1. `ModerationWorker` consumes a message from `comments.incoming`
+2. `LanguageDetector` checks if the text is Greek (Unicode ratio ≥ 30%)
+3. If Greek: `HttpTranslator` calls the Python sidecar to translate EL → EN
+   - On sidecar failure the message is emitted with `label = "unknown"` (fail-open)
+4. `OnnxModerationService` tokenizes with `XlmrTokenizer` and runs ONNX inference
+5. `ModerationProducer` publishes the verdict to `comments.moderated`
+6. Kafka offset is committed only after the produce is acknowledged
 
 ---
 
-## Estrutura de arquivos final
+## Services
+
+| Container | Image | Role |
+|---|---|---|
+| `tm-zookeeper` | `confluentinc/cp-zookeeper:7.6.1` | Kafka coordination |
+| `tm-kafka` | `confluentinc/cp-kafka:7.6.1` | Message broker |
+| `tm-translator` | Python 3.11 / FastAPI | Greek → English translation |
+| `tm-moderation` | .NET 8 Worker | Toxicity classification |
+
+---
+
+## ML Models
+
+### Toxicity Classifier
+
+[`textdetox/xlmr-large-toxicity-classifier`](https://huggingface.co/textdetox/xlmr-large-toxicity-classifier) — XLM-RoBERTa Large fine-tuned for multilingual toxicity detection. Exported to ONNX via [Optimum](https://huggingface.co/docs/optimum/index).
+
+Supported languages (native): EN, PT, RU, UK, DE, ES, AR, HI, ZH, AM.
+
+Greek is handled via translation (see below).
+
+**Output format:** 2-class softmax `[non-toxic, toxic]` or single-logit sigmoid, both supported automatically.
+
+### Greek Translator
+
+[`Helsinki-NLP/opus-mt-grk-en`](https://huggingface.co/Helsinki-NLP/opus-mt-grk-en) — MarianMT model for Greek → English translation. Pre-downloaded at image build time. Runs as a FastAPI sidecar with beam search decoding (`num_beams=4`, `early_stopping=True`).
+
+### Tokenizer
+
+XLM-RoBERTa SentencePiece tokenizer (`sentencepiece.bpe.model`) loaded via `Microsoft.ML.Tokenizers`. Applies fairseq ID offset remapping (`+1`) to align internal SentencePiece IDs with the ONNX model's expected token IDs.
+
+---
+
+## Project Structure
 
 ```
 TextMediation/
-├── docker-compose.yaml                          (NOVO — raiz)
-├── TextMediation.sln                            (atualizar referência)
-├── models/                                      (NOVO — volume montado no container)
+├── docker-compose.yaml
+├── models/                          # Mount point for ONNX + SentencePiece files (not committed)
 │   ├── model.onnx
-│   ├── sentencepiece.bpe.model
-│   └── config.json                              (labels do classificador)
-├── src/
-│   └── TextMediation.Worker/                    (renomear de TextMediation.API)
-│       ├── TextMediation.Worker.csproj          (reescrever como Worker SDK)
-│       ├── Program.cs                           (reescrever — host genérico)
-│       ├── Dockerfile                           (reescrever — multi-stage + libgomp1)
-│       ├── appsettings.json                     (Kafka + Model)
-│       ├── Workers/
-│       │   └── ModerationWorker.cs              (BackgroundService — loop consume/produce)
-│       ├── Services/
-│       │   ├── IModerationService.cs
-│       │   ├── OnnxModerationService.cs         (InferenceSession + softmax)
-│       │   ├── XlmrTokenizer.cs                 (SentencePiece + offsets XLM-R)
-│       │   └── ModerationProducer.cs            (wrapper Producer)
-│       ├── Models/
-│       │   ├── IncomingComment.cs
-│       │   ├── ModeratedComment.cs
-│       │   └── LabelScore.cs
-│       └── Options/
-│           ├── KafkaOptions.cs
-│           └── ModelOptions.cs
-└── docs/
-    └── EXPORT_MODEL.md                          (NOVO — instruções HuggingFace → ONNX)
+│   └── sentencepiece.bpe.model
+└── src/
+    ├── TextMediation.Translator/    # Python sidecar
+    │   ├── Dockerfile
+    │   ├── main.py
+    │   └── requirements.txt
+    └── TextMediation.Worker/        # .NET 8 Worker Service
+        ├── Dockerfile
+        ├── Program.cs
+        ├── appsettings.json
+        ├── Models/
+        │   ├── IncomingComment.cs
+        │   ├── LabelScore.cs
+        │   └── ModeratedComment.cs
+        ├── Options/
+        │   ├── KafkaOptions.cs
+        │   ├── ModelOptions.cs
+        │   └── TranslatorOptions.cs
+        ├── Services/
+        │   ├── HttpTranslator.cs
+        │   ├── IModerationService.cs
+        │   ├── ITranslator.cs
+        │   ├── LanguageDetector.cs
+        │   ├── ModerationProducer.cs
+        │   ├── OnnxModerationService.cs
+        │   └── XlmrTokenizer.cs
+        └── Workers/
+            └── ModerationWorker.cs
 ```
-
-Arquivos a remover do projeto atual: `Controllers/`, `WeatherForecast.cs`, `TextMediation.API.http`, `Properties/launchSettings.json` (ou adaptar).
 
 ---
 
-## Especificação dos arquivos
+## Kafka Topics
 
-### 1. `src/TextMediation.Worker/TextMediation.Worker.csproj`
+| Topic | Direction | Schema |
+|---|---|---|
+| `comments.incoming` | Input | `IncomingComment` JSON |
+| `comments.moderated` | Output | `ModeratedComment` JSON |
 
-- SDK: `Microsoft.NET.Sdk.Worker`
-- `TargetFramework`: `net8.0`
-- `Nullable`: enable ; `ImplicitUsings`: enable
-- PackageReferences:
-  - `Confluent.Kafka` 2.5.x
-  - `Microsoft.ML.OnnxRuntime` 1.19.x (CPU; trocar para `.Gpu` se quiser)
-  - `Microsoft.ML.Tokenizers` 0.22.x (tem `SentencePieceTokenizer`)
-  - `Microsoft.Extensions.Hosting` 8.0.x
-  - `Microsoft.Extensions.Options.ConfigurationExtensions` 8.0.x
-- Sem `DockerfileContext` inherited do VS; manter limpo.
+### IncomingComment
 
-### 2. `Program.cs`
-
-- `Host.CreateApplicationBuilder(args)` (modelo .NET 8 genérico).
-- Binding: `KafkaOptions` ← `Kafka`, `ModelOptions` ← `Model`.
-- DI singletons: `XlmrTokenizer`, `IModerationService → OnnxModerationService`, `ModerationProducer`.
-- `builder.Services.AddHostedService<ModerationWorker>()`.
-- Logging console + request id scopes.
-
-### 3. `Options/KafkaOptions.cs`
-
-Campos: `BootstrapServers`, `GroupId`, `InputTopic`, `OutputTopic`, `AutoOffsetReset` (default Earliest), `SessionTimeoutMs`.
-
-### 4. `Options/ModelOptions.cs`
-
-Campos: `ModelPath` (default `/models/model.onnx`), `SentencePiecePath` (default `/models/sentencepiece.bpe.model`), `MaxSequenceLength` (128), `Labels` (array: `["non-toxic", "toxic"]` ou qualquer número de classes), `IntraOpNumThreads`.
-
-### 5. `Services/XlmrTokenizer.cs`
-
-Responsável por:
-- Carregar `sentencepiece.bpe.model` via `SentencePieceTokenizer.Create(File.OpenRead(path))` (Microsoft.ML.Tokenizers 0.22+).
-- Aplicar o **offset do XLM-R**: os IDs do SentencePiece são deslocados +1 no vocabulário do XLM-R (reservando 0–3 para `<s>, <pad>, </s>, <unk>`). Confirmar com `tokenizer_config.json` no export.
-- Envelopar com tokens especiais: `[<s>] + tokens + [</s>]` (IDs 0 e 2).
-- Truncar para `MaxSequenceLength`, pad com ID 1, devolver `input_ids` (`long[]`) e `attention_mask` (`long[]`).
-- Método: `(long[] ids, long[] mask) Encode(string text)`.
-
-Observação crítica: se a biblioteca `Microsoft.ML.Tokenizers` 0.22 não expuser `SentencePieceTokenizer` diretamente, usar `LlamaTokenizer` (também baseado em SentencePiece BPE) ou ler o `tokenizer.json` (fast tokenizer) com `BpeTokenizer.Create`. Decisão final feita na implementação — o plano permite fallback.
-
-### 6. `Services/OnnxModerationService.cs`
-
-- Singleton. Mantém `InferenceSession` criada no construtor com:
-  - `SessionOptions { IntraOpNumThreads = opts.IntraOpNumThreads, GraphOptimizationLevel = ORT_ENABLE_ALL }`.
-- Método `ModerationResult Classify(string text)`:
-  1. `(ids, mask) = tokenizer.Encode(text)`.
-  2. Monta `DenseTensor<long>` shape `[1, seqLen]` para `input_ids` e `attention_mask`.
-  3. `session.Run(inputs)` com `NamedOnnxValue`s.
-  4. Lê tensor `logits` shape `[1, nLabels]`, aplica softmax numericamente estável, mapeia para `Labels[i]`.
-  5. Retorna `ModeratedComment { CommentId, OriginalText, Label, Score, AllScores, ModeratedAt }`.
-- `Classify` é puro e thread-safe; `InferenceSession.Run` é thread-safe.
-
-### 7. `Services/ModerationProducer.cs`
-
-- `IProducer<string, string>` criado com `ProducerConfig { BootstrapServers, EnableIdempotence = true, Acks = All, LingerMs = 5, CompressionType = Snappy }`.
-- Método `Task ProduceAsync(string key, ModeratedComment msg, CancellationToken ct)` — usa `System.Text.Json`.
-- Implementa `IDisposable` (`Flush` + `Dispose`).
-
-### 8. `Workers/ModerationWorker.cs`
-
-Loop robusto:
-
-```
-ConsumerConfig { BootstrapServers, GroupId, EnableAutoCommit = false,
-                 AutoOffsetReset = Earliest, EnablePartitionEof = false }
-
-while (!stoppingToken.IsCancellationRequested) {
-    try {
-        var cr = consumer.Consume(stoppingToken);         // bloqueia
-        if (cr?.Message is null) continue;
-        var incoming = JsonSerializer.Deserialize<IncomingComment>(cr.Message.Value);
-        var result   = moderation.Classify(incoming.Text);
-        result.CommentId = incoming.Id;
-        await producer.ProduceAsync(incoming.Id, result, stoppingToken);
-        consumer.Commit(cr);                              // commit só após produce
-    }
-    catch (ConsumeException ex) when (ex.Error.IsFatal) { throw; }
-    catch (ConsumeException ex) { log.Error(ex, "consume error — continuando"); }
-    catch (OperationCanceledException) { break; }
-    catch (Exception ex) {
-        log.Error(ex, "unexpected — skip offset / ou DLQ");
-        // Opcional: produzir em comments.moderated.dlq
-    }
+```json
+{
+  "id": "c-001",
+  "text": "Your comment text here",
+  "author": "optional-user-id",
+  "timestamp": "2024-01-01T00:00:00Z"
 }
-consumer.Close();
 ```
 
-- Consumer subscribe no `OnStartAsync` (ou primeiro iter).
-- `StopAsync` chama `Close()` com timeout.
+### ModeratedComment
 
-### 9. `Dockerfile` (substituir o atual)
-
-Multi-stage otimizado:
-
-```dockerfile
-# ---------- build ----------
-FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
-WORKDIR /src
-COPY src/TextMediation.Worker/TextMediation.Worker.csproj src/TextMediation.Worker/
-RUN dotnet restore src/TextMediation.Worker/TextMediation.Worker.csproj
-COPY . .
-RUN dotnet publish src/TextMediation.Worker/TextMediation.Worker.csproj \
-    -c Release -o /app/publish /p:UseAppHost=false
-
-# ---------- runtime ----------
-FROM mcr.microsoft.com/dotnet/runtime:8.0 AS final
-# libgomp1 é requerida pelo OpenMP dentro do onnxruntime nativo
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
-WORKDIR /app
-COPY --from=publish /app/publish .
-ENV DOTNET_EnableDiagnostics=0
-ENTRYPOINT ["dotnet", "TextMediation.Worker.dll"]
+```json
+{
+  "commentId": "c-001",
+  "originalText": "Your comment text here",
+  "label": "non-toxic",
+  "score": 0.997,
+  "allScores": [],
+  "inferenceMs": 94.5,
+  "moderatedAt": "2024-01-01T00:00:00Z"
+}
 ```
 
-Usar `dotnet/runtime` (não `aspnet`) porque é Worker puro.
+`label` is one of: `non-toxic`, `toxic`, `unknown` (translation failure).
 
-### 10. `docker-compose.yaml` (raiz do repo)
+---
 
-- **zookeeper**: `confluentinc/cp-zookeeper:7.6.1`, porta 2181 interna.
-- **kafka**: `confluentinc/cp-kafka:7.6.1`, 2 listeners:
-  - `INTERNAL://kafka:9092` (containers)
-  - `HOST://localhost:9094` (dev no host)
-  - `KAFKA_AUTO_CREATE_TOPICS_ENABLE=true` (ou `kafka-init` separado).
-  - `healthcheck` com `kafka-topics --bootstrap-server localhost:9092 --list`.
-- **moderation**: build `.` com `dockerfile: src/TextMediation.Worker/Dockerfile`, env:
-  - `Kafka__BootstrapServers=kafka:9092`
-  - `Kafka__GroupId=moderation-worker`
-  - `Kafka__InputTopic=comments.incoming`
-  - `Kafka__OutputTopic=comments.moderated`
-  - `Model__ModelPath=/models/model.onnx`
-  - `Model__SentencePiecePath=/models/sentencepiece.bpe.model`
-  - `depends_on: kafka: { condition: service_healthy }`
-  - `volumes: ./models:/models:ro`
-- Rede compartilhada default.
+## Configuration
 
-### 11. `docs/EXPORT_MODEL.md`
+### Worker (`appsettings.json` / environment variables)
 
-Instruções passo a passo:
+| Key | Default | Description |
+|---|---|---|
+| `Kafka__BootstrapServers` | `kafka:9092` | Kafka broker address |
+| `Kafka__GroupId` | `moderation-worker` | Consumer group |
+| `Kafka__InputTopic` | `comments.incoming` | Source topic |
+| `Kafka__OutputTopic` | `comments.moderated` | Destination topic |
+| `Kafka__AutoOffsetReset` | `Earliest` | Offset reset policy |
+| `Model__ModelPath` | `/models/model.onnx` | ONNX model file |
+| `Model__SentencePiecePath` | `/models/sentencepiece.bpe.model` | Tokenizer model file |
+| `Model__MaxSequenceLength` | `128` | Max token sequence length |
+| `Model__IntraOpNumThreads` | `1` | ONNX intra-op threads |
+| `Model__Labels` | `["non-toxic","toxic"]` | Label order (must match model `id2label`) |
+| `Model__ConfidenceThreshold` | `0.50` | Min safe score to classify as non-toxic |
+| `Translator__BaseUrl` | `http://translator:8000` | Translator sidecar URL |
+| `Translator__TimeoutSeconds` | `15` | HTTP timeout for translation calls |
+| `Translator__GreekRatioThreshold` | `0.30` | Min Greek char ratio to trigger translation |
+
+### Translator (`docker-compose.yaml` environment)
+
+| Variable | Default | Description |
+|---|---|---|
+| `TRANSLATOR_MODEL` | `Helsinki-NLP/opus-mt-grk-en` | HuggingFace model ID |
+| `TRANSLATOR_MAX_LENGTH` | `256` | Max tokens for generation |
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Docker Desktop with Compose V2
+- ONNX model file and SentencePiece tokenizer placed in `./models/`
+
+### Obtaining the models
+
+Export the toxicity classifier to ONNX using [Optimum](https://huggingface.co/docs/optimum/exporters/onnx/usage_guides/export_a_model):
 
 ```bash
-# Requer Python 3.10+
-pip install --upgrade "optimum[exporters]" transformers sentencepiece onnx
-
-# Exporta DistilXLM-R classificador (ex: textdetox/xlmr-large-toxicity-classifier
-# ou qualquer fine-tune multilíngue compatível) para ./models
-optimum-cli export onnx \
-  --model <hf-repo-id> \
-  --task text-classification \
-  --opset 17 \
-  ./models
-
-# Copiar o SentencePiece BPE para o nome esperado:
-cp ./models/sentencepiece.bpe.model ./models/sentencepiece.bpe.model
-
-# Validar que existem: model.onnx, sentencepiece.bpe.model, config.json
-ls ./models
+docker run --rm -it \
+  -v "$(pwd)/models:/out" \
+  python:3.11-slim bash -c "
+    pip install -q optimum[exporters] transformers sentencepiece &&
+    optimum-cli export onnx \
+      --model textdetox/xlmr-large-toxicity-classifier \
+      --task text-classification \
+      /out/xlmr-toxicity
+  "
 ```
 
-Notas:
-- A pasta `./models` é montada como volume read-only no container (`/models`).
-- Ajustar `Model.Labels` em `appsettings.json` conforme `id2label` do `config.json`.
-- Para rodar com GPU, trocar o pacote NuGet para `Microsoft.ML.OnnxRuntime.Gpu` e adicionar runtime CUDA ao Dockerfile.
+Then copy the exported files:
+
+```
+models/model.onnx                  ← from /out/xlmr-toxicity/model.onnx
+models/sentencepiece.bpe.model     ← from /out/xlmr-toxicity/sentencepiece.bpe.model
+```
+
+### Running
+
+```bash
+docker compose up -d
+docker logs -f tm-translator   # wait for "Translator ready."
+docker logs -f tm-moderation   # wait for "Consumer subscribed to 'comments.incoming'"
+```
+
+### Sending a test message (PowerShell)
+
+```powershell
+$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
+@"
+c-en-01:{"id":"c-en-01","text":"You are an idiot and understand nothing"}
+c-pt-01:{"id":"c-pt-01","text":"Você é um idiota e não entende nada"}
+c-el-01:{"id":"c-el-01","text":"Είσαι ένα τόσο ηλίθιο άτομο"}
+c-ok-01:{"id":"c-ok-01","text":"Thank you for your help today"}
+"@ | docker exec -i tm-kafka kafka-console-producer `
+  --bootstrap-server localhost:9092 `
+  --topic comments.incoming `
+  --property "key.separator=:" `
+  --property "parse.key=true"
+```
+
+### Reading output
+
+```bash
+docker exec tm-kafka kafka-console-consumer \
+  --bootstrap-server kafka:9092 \
+  --topic comments.moderated \
+  --from-beginning
+```
 
 ---
 
-## Arquivos críticos a modificar
+## Dependencies
 
-- `TextMediation.sln` — atualizar referência para `TextMediation.Worker`.
-- `src/TextMediation.Worker/TextMediation.Worker.csproj` — reescrever.
-- `src/TextMediation.Worker/Program.cs` — reescrever.
-- `src/TextMediation.Worker/Dockerfile` — reescrever (multi-stage, libgomp1, runtime).
-- `.dockerignore` — adicionar `models/`, `bin/`, `obj/`, `.vs/`.
-- Criar todos os arquivos de `Services/`, `Workers/`, `Models/`, `Options/`.
-- Criar `docker-compose.yaml` na raiz.
-- Criar `docs/EXPORT_MODEL.md`.
+### .NET Worker
 
-Arquivos a deletar: `Controllers/`, `WeatherForecast.cs`, `TextMediation.API.http`, `appsettings.Development.json` se ficar redundante.
+| Package | Version | Purpose |
+|---|---|---|
+| `Confluent.Kafka` | 2.5.3 | Kafka producer/consumer |
+| `Microsoft.ML.OnnxRuntime` | 1.19.2 | ONNX model inference |
+| `Microsoft.ML.Tokenizers` | 3.0.0-preview | SentencePiece tokenization |
+| `Microsoft.Extensions.Hosting` | 8.0.1 | Worker Service host |
+| `Microsoft.Extensions.Http` | 8.0.1 | Typed HTTP client factory |
+| `Microsoft.Extensions.Options.ConfigurationExtensions` | 8.0.0 | Options binding |
 
-Funções/utilitários existentes reutilizáveis: **nenhuma** — template padrão do VS, tudo será substituído.
+### Python Sidecar
 
----
-
-## Verificação end-to-end
-
-1. **Exportar o modelo**: seguir `docs/EXPORT_MODEL.md` e confirmar `./models/model.onnx` + `./models/sentencepiece.bpe.model`.
-2. **Subir a stack**: `docker compose up --build`. Observar logs do serviço `moderation` ficar em *"Consumer subscribed, waiting messages..."*.
-3. **Teste manual** — em outro terminal, entrar no container do kafka e publicar uma mensagem:
-   ```bash
-   docker compose exec kafka kafka-console-producer \
-     --bootstrap-server localhost:9092 --topic comments.incoming \
-     --property parse.key=true --property key.separator=:
-   # digitar: c1:{"id":"c1","text":"eu te odeio"}
-   ```
-4. **Consumir o resultado**:
-   ```bash
-   docker compose exec kafka kafka-console-consumer \
-     --bootstrap-server localhost:9092 --topic comments.moderated \
-     --from-beginning --property print.key=true
-   ```
-   Esperado: JSON `{"commentId":"c1","label":"toxic","score":0.97,...}`.
-5. **Teste de latência**: enviar 1000 mensagens via `kafka-producer-perf-test` e medir p50/p95 nos logs (`Classify` tempo).
-6. **Resiliência**: `docker compose stop kafka && sleep 5 && docker compose start kafka` — o worker deve reconectar sem reiniciar o container graças ao loop try/catch + `ConsumeException` não-fatal.
-7. **Shutdown limpo**: `docker compose down`; confirmar que o worker loga `"Closing consumer..."` antes de sair.
+| Package | Version | Purpose |
+|---|---|---|
+| `fastapi` | 0.115.0 | REST API framework |
+| `uvicorn[standard]` | 0.30.6 | ASGI server |
+| `transformers` | 4.44.2 | MarianMT model loading |
+| `torch` | 2.4.1 | PyTorch inference backend |
+| `sentencepiece` | 0.2.0 | Tokenizer for MarianMT |
+| `sacremoses` | 0.1.1 | Text preprocessing |
 
 ---
 
-## Observações finais
+## Design Decisions
 
-- O plano mantém **singletons** para tokenizer, InferenceSession e Producer — eliminando alocações por mensagem e garantindo baixa latência.
-- **At-least-once** end-to-end: `EnableAutoCommit=false` + commit manual pós-produce; com `EnableIdempotence=true` no producer evita duplicatas dentro de uma sessão.
-- O tratamento de erro não bloqueia o loop em falhas transientes de consumo, mas propaga `IsFatal`.
-- A escolha de `SentencePieceTokenizer` vs `LlamaTokenizer` em Microsoft.ML.Tokenizers será validada na implementação — ambas são suficientes para XLM-R com os offsets corretos.
+**Fail-open on translation failure** — if the translator sidecar is unavailable, the worker emits `label = "unknown"` rather than blocking or retrying indefinitely. This prevents a translator outage from stalling the entire moderation pipeline.
+
+**Manual Kafka commit** — offsets are committed only after the moderated verdict is successfully produced to `comments.moderated`. This guarantees at-least-once delivery with no silent message loss.
+
+**ONNX export over direct inference** — running the HuggingFace model through ONNX Runtime instead of PyTorch in the .NET worker eliminates the Python runtime dependency from the critical path, reduces memory footprint, and enables graph-level optimizations (`ORT_ENABLE_ALL`).
+
+**SentencePiece binary model** — `Microsoft.ML.Tokenizers` requires the binary `.model` protobuf format, not the `tokenizer.json` used by the HuggingFace tokenizer library. The SentencePiece IDs are remapped with a `+1` fairseq offset to match the model's expected vocabulary indices.
+
+**Greek detection without Unicode APIs** — `LanguageDetector` uses direct codepoint range comparisons (`U+0370–U+03FF`, `U+1F00–U+1FFF`) rather than `char.IsLetter()`, which behaves inconsistently under `InvariantGlobalization=true` in containerized .NET deployments.
